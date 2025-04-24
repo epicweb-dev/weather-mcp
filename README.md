@@ -1,4 +1,4 @@
-# Country Weather MCP
+# Weather MCP
 
-This is a simple MCP tool that returns the weather of the given country.
-Defaults to the country found via the `CF-IPCountry` header.
+This is a simple MCP tool that returns the weather of the given logitude and
+latitude based on the OpenWeatherMap API.

@@ -4,13 +4,13 @@
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "country-weather-mcp",
+	"name": "weather-mcp",
 	"main": "src/index.ts",
 	"compatibility_date": "2025-04-17",
 	"compatibility_flags": ["nodejs_compat"],
 	"migrations": [
 		{
-			"new_sqlite_classes": ["CoutryWeatherMCP"],
+			"new_sqlite_classes": ["WeatherMCP"],
 			"tag": "v1",
 		},
 	],
@@ -18,8 +18,8 @@
 	"durable_objects": {
 		"bindings": [
 			{
-				"class_name": "CoutryWeatherMCP",
-				"name": "COUNTRY_WEATHER_MCP_OBJECT",
+				"class_name": "WeatherMCP",
+				"name": "WEATHER_MCP_OBJECT",
 			},
 		],
 	},

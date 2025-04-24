@@ -1,43 +1,64 @@
 /// <reference path="../types/worker-configuration.d.ts" />
 
-import { AsyncLocalStorage } from 'async_hooks'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { McpAgent } from 'agents/mcp'
 import { z } from 'zod'
 
-const requestStorage = new AsyncLocalStorage<Request>()
+const weatherResultSchema = z.object({
+	current: z.object({
+		temperature_2m: z.number(),
+		relative_humidity_2m: z.number(),
+		wind_speed_10m: z.number(),
+		weather_code: z.number(),
+	}),
+})
 
-interface GeocodingResult {
-	name: string
-	latitude: number
-	longitude: number
-	country: string
-	results: Array<{
-		name: string
-		latitude: number
-		longitude: number
-		country: string
-	}>
-}
+const nominatimResponseSchema = z.object({
+	address: z
+		.object({
+			city: z.string().optional(),
+			town: z.string().optional(),
+			village: z.string().optional(),
+			country: z.string().optional(),
+		})
+		.optional(),
+})
 
-interface WeatherResult {
-	current: {
-		temperature_2m: number
-		relative_humidity_2m: number
-		wind_speed_10m: number
-		weather_code: number
+// Helper function to get location details from coordinates
+async function reverseGeocode(latitude: number, longitude: number) {
+	const response = await fetch(
+		`https://nominatim.openstreetmap.org/reverse?lat=${latitude}&lon=${longitude}&format=json`,
+		{
+			headers: {
+				'User-Agent': 'Weather MCP Tool/1.0',
+			},
+		},
+	)
+	const data = nominatimResponseSchema.parse(await response.json())
+	return {
+		city:
+			data.address?.city ||
+			data.address?.town ||
+			data.address?.village ||
+			'Unknown location',
+		country: data.address?.country || 'Unknown country',
 	}
 }
 
-export class CoutryWeatherMCP extends McpAgent<Env> {
+// Helper function to convert Celsius to Fahrenheit
+function celsiusToFahrenheit(celsius: number): number {
+	return (celsius * 9) / 5 + 32
+}
+
+export class WeatherMCP extends McpAgent<Env> {
 	server = new McpServer(
 		{
-			name: 'CountryWeather',
+			name: 'Weather',
 			version: '1.0.0',
 		},
 		{
 			instructions: `
-CountryWeather is a tool that allows users to get the weather of a given country.
+Weather is a tool that allows users to get the weather of a given latitude and longitude.
 			`.trim(),
 		},
 	)
@@ -45,57 +66,51 @@ CountryWeather is a tool that allows users to get the weather of a given country
 		super(ctx, env)
 	}
 
-	onSSEMcpMessage(sessionId: string, request: Request) {
-		return requestStorage.run(request, () =>
-			super.onSSEMcpMessage(sessionId, request),
-		)
-	}
-
 	async init() {
 		this.server.tool(
 			'getWeather',
-			'Get the weather of a given country. Defaults to the country found via the `CF-IPCountry` header.',
+			'Get the weather of a given latitude and longitude.',
 			{
-				country: z.string().optional(),
+				latitude: z.number(),
+				longitude: z.number(),
+				unit: z
+					.enum(['celsius', 'fahrenheit'])
+					.optional()
+					.default('fahrenheit'),
 			},
-			async ({ country }) => {
-				const request = requestStorage.getStore()
-				country ??= request?.headers.get('CF-IPCountry') ?? undefined
-				if (!country) {
-					return {
-						isError: true,
-						content: [{ type: 'text', text: 'Country not detected' }],
-					}
-				}
-
-				// First get coordinates for the country using geocoding API
-				const geocodingResponse = await fetch(
-					`https://geocoding-api.open-meteo.com/v1/search?name=${country}&count=1`,
-				)
-				const geocodingData =
-					(await geocodingResponse.json()) as GeocodingResult
-
-				if (!geocodingData.results?.[0]) {
-					return {
-						isError: true,
-						content: [{ type: 'text', text: 'Country not found' }],
-					}
-				}
-
-				const { latitude, longitude } = geocodingData.results[0]
+			async ({ latitude, longitude, unit }) => {
+				// First get location details
+				const { city, country } = await reverseGeocode(latitude, longitude)
 
 				// Then get weather data using those coordinates
 				const weatherResponse = await fetch(
 					`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code`,
 				)
-				const weatherData = (await weatherResponse.json()) as WeatherResult
+				const weatherJson = await weatherResponse.json()
+				const weatherData = await weatherResultSchema
+					.parseAsync(weatherJson)
+					.catch((error) => {
+						console.error('Failed to parse weather response:', error)
+						return null
+					})
 
-				if (!weatherData.current) {
+				if (!weatherData?.current) {
 					return {
 						isError: true,
-						content: [{ type: 'text', text: 'Weather data not available' }],
+						content: [
+							{
+								type: 'text',
+								text: 'Weather data not available or invalid API response',
+							},
+						],
 					}
 				}
+
+				// Convert temperature if needed
+				const temperature =
+					unit === 'fahrenheit'
+						? celsiusToFahrenheit(weatherData.current.temperature_2m)
+						: weatherData.current.temperature_2m
 
 				// Convert weather code to description
 				const weatherDescription = getWeatherDescription(
@@ -106,8 +121,8 @@ CountryWeather is a tool that allows users to get the weather of a given country
 					content: [
 						{
 							type: 'text',
-							text: `Weather in ${geocodingData.results[0].name}, ${geocodingData.results[0].country}:
-• Temperature: ${weatherData.current.temperature_2m}°C
+							text: `Weather in ${city}, ${country}:
+• Temperature: ${temperature.toFixed(1)}°${unit === 'fahrenheit' ? 'F' : 'C'}
 • Humidity: ${weatherData.current.relative_humidity_2m}%
 • Wind Speed: ${weatherData.current.wind_speed_10m} km/h
 • Conditions: ${weatherDescription}`,
@@ -154,6 +169,6 @@ function getWeatherDescription(code: number): string {
 	return weatherCodes[code] || 'Unknown'
 }
 
-export default CoutryWeatherMCP.mount('/mcp', {
-	binding: 'COUNTRY_WEATHER_MCP_OBJECT',
+export default WeatherMCP.mount('/mcp', {
+	binding: 'WEATHER_MCP_OBJECT',
 })
