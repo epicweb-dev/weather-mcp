@@ -117,20 +117,34 @@ Weather is a tool that allows users to get the weather of a given latitude and l
 					.number()
 					.optional()
 					.describe(
-						'The latitude of the location to get the weather for. Defaults to the latitude of the request.',
+						`
+The latitude of the location to get the weather for.
+
+Defaults to the latitude of the request which is often close enough, but if
+there's another tool you can use to get the latitude, you can use that instead.
+						`.trim(),
 					),
 				longitude: z.coerce
 					.number()
 					.optional()
 					.describe(
-						'The longitude of the location to get the weather for. Defaults to the longitude of the request.',
+						`
+The longitude of the location to get the weather for.
+
+Defaults to the longitude of the request which is often close enough, but if
+there's another tool you can use to get the longitude, you can use that instead.
+						`.trim(),
 					),
 				unit: z
 					.enum(['celsius', 'fahrenheit'])
 					.optional()
 					.default('fahrenheit')
 					.describe(
-						'The unit of the temperature to get the weather for. Defaults to fahrenheit.',
+						`
+The unit of the temperature to get the weather for.
+
+Defaults to fahrenheit.
+						`.trim(),
 					),
 			},
 			async ({ latitude, longitude, unit }) => {
