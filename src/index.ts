@@ -62,72 +62,73 @@ Weather is a tool that allows users to get the weather of a given latitude and l
 			`.trim(),
 		},
 	)
-	constructor(ctx: DurableObjectState, env: Env) {
-		super(ctx, env)
-	}
 
 	async init() {
 		this.server.tool(
 			'getWeather',
 			'Get the weather of a given latitude and longitude.',
 			{
-				latitude: z.number(),
-				longitude: z.number(),
+				latitude: z.coerce.number(),
+				longitude: z.coerce.number(),
 				unit: z
 					.enum(['celsius', 'fahrenheit'])
 					.optional()
 					.default('fahrenheit'),
 			},
 			async ({ latitude, longitude, unit }) => {
-				// First get location details
-				const { city, country } = await reverseGeocode(latitude, longitude)
+				try {
+					// First get location details
+					const { city, country } = await reverseGeocode(latitude, longitude)
 
-				// Then get weather data using those coordinates
-				const weatherResponse = await fetch(
-					`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code`,
-				)
-				const weatherJson = await weatherResponse.json()
-				const weatherData = await weatherResultSchema
-					.parseAsync(weatherJson)
-					.catch((error) => {
-						console.error('Failed to parse weather response:', error)
-						return null
-					})
+					// Then get weather data using those coordinates
+					const weatherResponse = await fetch(
+						`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code`,
+					)
+					const weatherJson = await weatherResponse.json()
+					const weatherData = weatherResultSchema.parse(weatherJson)
 
-				if (!weatherData?.current) {
+					if (!weatherData?.current) {
+						return {
+							isError: true,
+							content: [
+								{
+									type: 'text',
+									text: 'Weather data not available or invalid API response',
+								},
+							],
+						}
+					}
+
+					// Convert temperature if needed
+					const temperature =
+						unit === 'fahrenheit'
+							? celsiusToFahrenheit(weatherData.current.temperature_2m)
+							: weatherData.current.temperature_2m
+
+					// Convert weather code to description
+					const weatherDescription = getWeatherDescription(
+						weatherData.current.weather_code,
+					)
+
 					return {
-						isError: true,
 						content: [
 							{
 								type: 'text',
-								text: 'Weather data not available or invalid API response',
-							},
-						],
-					}
-				}
-
-				// Convert temperature if needed
-				const temperature =
-					unit === 'fahrenheit'
-						? celsiusToFahrenheit(weatherData.current.temperature_2m)
-						: weatherData.current.temperature_2m
-
-				// Convert weather code to description
-				const weatherDescription = getWeatherDescription(
-					weatherData.current.weather_code,
-				)
-
-				return {
-					content: [
-						{
-							type: 'text',
-							text: `Weather in ${city}, ${country}:
+								text: `
+Weather in ${city}, ${country}:
 • Temperature: ${temperature.toFixed(1)}°${unit === 'fahrenheit' ? 'F' : 'C'}
 • Humidity: ${weatherData.current.relative_humidity_2m}%
 • Wind Speed: ${weatherData.current.wind_speed_10m} km/h
-• Conditions: ${weatherDescription}`,
-						},
-					],
+• Conditions: ${weatherDescription}
+								`.trim(),
+							},
+						],
+					}
+				} catch (error) {
+					return {
+						isError: true,
+						content: [{ type: 'text', text: getErrorMessage(error) }],
+					}
 				}
 			},
 		)
@@ -167,6 +168,20 @@ function getWeatherDescription(code: number): string {
 		99: 'Thunderstorm with heavy hail',
 	}
 	return weatherCodes[code] || 'Unknown'
+}
+
+function getErrorMessage(error: unknown) {
+	if (typeof error === 'string') return error
+	if (
+		error &&
+		typeof error === 'object' &&
+		'message' in error &&
+		typeof error.message === 'string'
+	) {
+		return error.message
+	}
+	console.error('Unable to get error message for error', error)
+	return 'Unknown Error'
 }
 
 export default WeatherMCP.mount('/mcp', {
