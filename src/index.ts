@@ -1,53 +1,88 @@
 /// <reference path="../types/worker-configuration.d.ts" />
 
+import { AsyncLocalStorage } from 'async_hooks'
+import { invariant } from '@epic-web/invariant'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { McpAgent } from 'agents/mcp'
 import { z } from 'zod'
 
-const weatherResultSchema = z.object({
-	current: z.object({
-		temperature_2m: z.number(),
-		relative_humidity_2m: z.number(),
-		wind_speed_10m: z.number(),
-		weather_code: z.number(),
+export interface Env {
+	ACCUWEATHER_API_KEY: string
+}
+
+const requestStorage = new AsyncLocalStorage<Request>()
+
+const accuWeatherLocationSchema = z.object({
+	Key: z.string(),
+	LocalizedName: z.string(),
+	Country: z.object({
+		LocalizedName: z.string(),
 	}),
 })
 
-const nominatimResponseSchema = z.object({
-	address: z
+const accuWeatherCurrentConditionsSchema = z.object({
+	WeatherText: z.string(),
+	Temperature: z.object({
+		Metric: z.object({
+			Value: z.number(),
+			Unit: z.string(),
+		}),
+		Imperial: z.object({
+			Value: z.number(),
+			Unit: z.string(),
+		}),
+	}),
+	RelativeHumidity: z.number().optional(),
+	Wind: z
 		.object({
-			city: z.string().optional(),
-			town: z.string().optional(),
-			village: z.string().optional(),
-			country: z.string().optional(),
+			Speed: z.object({
+				Metric: z.object({
+					Value: z.number(),
+					Unit: z.string(),
+				}),
+				Imperial: z.object({
+					Value: z.number(),
+					Unit: z.string(),
+				}),
+			}),
 		})
 		.optional(),
 })
 
-// Helper function to get location details from coordinates
-async function reverseGeocode(latitude: number, longitude: number) {
-	const response = await fetch(
-		`https://nominatim.openstreetmap.org/reverse?lat=${latitude}&lon=${longitude}&format=json`,
-		{
-			headers: {
-				'User-Agent': 'Weather MCP Tool/1.0',
-			},
-		},
+// Helper function to get location key from coordinates
+async function getLocationKey(
+	latitude: number,
+	longitude: number,
+	apiKey: string,
+) {
+	const url = new URL(
+		'http://dataservice.accuweather.com/locations/v1/cities/geoposition/search',
 	)
-	const data = nominatimResponseSchema.parse(await response.json())
+	url.searchParams.append('apikey', apiKey)
+	url.searchParams.append('q', `${latitude},${longitude}`)
+	url.searchParams.append('details', 'true')
+
+	const response = await fetch(url.toString())
+	const json = await response.json()
+	const data = accuWeatherLocationSchema.parse(json)
 	return {
-		city:
-			data.address?.city ||
-			data.address?.town ||
-			data.address?.village ||
-			'Unknown location',
-		country: data.address?.country || 'Unknown country',
+		locationKey: data.Key,
+		city: data.LocalizedName,
+		country: data.Country.LocalizedName,
 	}
 }
 
-// Helper function to convert Celsius to Fahrenheit
-function celsiusToFahrenheit(celsius: number): number {
-	return (celsius * 9) / 5 + 32
+// Helper function to get current weather conditions
+async function getCurrentConditions(locationKey: string, apiKey: string) {
+	const url = new URL(
+		`http://dataservice.accuweather.com/currentconditions/v1/${locationKey}`,
+	)
+	url.searchParams.append('apikey', apiKey)
+	url.searchParams.append('details', 'true')
+
+	const response = await fetch(url.toString())
+	const data = (await response.json()) as unknown[]
+	return accuWeatherCurrentConditionsSchema.parse(data[0])
 }
 
 export class WeatherMCP extends McpAgent<Env> {
@@ -63,52 +98,73 @@ Weather is a tool that allows users to get the weather of a given latitude and l
 		},
 	)
 
+	constructor(ctx: DurableObjectState, env: Env) {
+		super(ctx, env)
+	}
+
+	onSSEMcpMessage(sessionId: string, request: Request) {
+		return requestStorage.run(request, async () =>
+			super.onSSEMcpMessage(sessionId, request),
+		)
+	}
+
 	async init() {
 		this.server.tool(
 			'getWeather',
 			'Get the weather of a given latitude and longitude.',
 			{
-				latitude: z.coerce.number(),
-				longitude: z.coerce.number(),
+				latitude: z.coerce
+					.number()
+					.optional()
+					.describe(
+						'The latitude of the location to get the weather for. Defaults to the latitude of the request.',
+					),
+				longitude: z.coerce
+					.number()
+					.optional()
+					.describe(
+						'The longitude of the location to get the weather for. Defaults to the longitude of the request.',
+					),
 				unit: z
 					.enum(['celsius', 'fahrenheit'])
 					.optional()
-					.default('fahrenheit'),
+					.default('fahrenheit')
+					.describe(
+						'The unit of the temperature to get the weather for. Defaults to fahrenheit.',
+					),
 			},
 			async ({ latitude, longitude, unit }) => {
 				try {
-					// First get location details
-					const { city, country } = await reverseGeocode(latitude, longitude)
+					const lat = latitude ?? requestStorage.getStore()?.cf?.latitude
+					const long = longitude ?? requestStorage.getStore()?.cf?.longitude
 
-					// Then get weather data using those coordinates
-					const weatherResponse = await fetch(
-						`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code`,
+					invariant(
+						typeof lat === 'number',
+						'Latitude is required and could not be found',
 					)
-					const weatherJson = await weatherResponse.json()
-					const weatherData = weatherResultSchema.parse(weatherJson)
+					invariant(
+						typeof long === 'number',
+						'Longitude is required and could not be found',
+					)
 
-					if (!weatherData?.current) {
-						return {
-							isError: true,
-							content: [
-								{
-									type: 'text',
-									text: 'Weather data not available or invalid API response',
-								},
-							],
-						}
-					}
+					const apiKey = this.env.ACCUWEATHER_API_KEY
+					invariant(apiKey, 'ACCUWEATHER_API_KEY is required')
 
-					// Convert temperature if needed
+					// Get location details and key
+					const { locationKey, city, country } = await getLocationKey(
+						lat,
+						long,
+						apiKey,
+					)
+
+					// Get current weather conditions
+					const weatherData = await getCurrentConditions(locationKey, apiKey)
+
+					// Get temperature in the requested unit
 					const temperature =
 						unit === 'fahrenheit'
-							? celsiusToFahrenheit(weatherData.current.temperature_2m)
-							: weatherData.current.temperature_2m
-
-					// Convert weather code to description
-					const weatherDescription = getWeatherDescription(
-						weatherData.current.weather_code,
-					)
+							? weatherData.Temperature.Imperial.Value
+							: weatherData.Temperature.Metric.Value
 
 					return {
 						content: [
@@ -117,9 +173,9 @@ Weather is a tool that allows users to get the weather of a given latitude and l
 								text: `
 Weather in ${city}, ${country}:
 • Temperature: ${temperature.toFixed(1)}°${unit === 'fahrenheit' ? 'F' : 'C'}
-• Humidity: ${weatherData.current.relative_humidity_2m}%
-• Wind Speed: ${weatherData.current.wind_speed_10m} km/h
-• Conditions: ${weatherDescription}
+${weatherData.RelativeHumidity ? `• Humidity: ${weatherData.RelativeHumidity}%` : ''}
+${weatherData.Wind ? `• Wind Speed: ${weatherData.Wind.Speed.Metric.Value} ${weatherData.Wind.Speed.Metric.Unit}` : ''}
+• Conditions: ${weatherData.WeatherText}
 								`.trim(),
 							},
 						],
@@ -133,41 +189,6 @@ Weather in ${city}, ${country}:
 			},
 		)
 	}
-}
-
-// Helper function to convert WMO weather codes to descriptions
-function getWeatherDescription(code: number): string {
-	const weatherCodes: Record<number, string> = {
-		0: 'Clear sky',
-		1: 'Mainly clear',
-		2: 'Partly cloudy',
-		3: 'Overcast',
-		45: 'Foggy',
-		48: 'Depositing rime fog',
-		51: 'Light drizzle',
-		53: 'Moderate drizzle',
-		55: 'Dense drizzle',
-		56: 'Light freezing drizzle',
-		57: 'Dense freezing drizzle',
-		61: 'Slight rain',
-		63: 'Moderate rain',
-		65: 'Heavy rain',
-		66: 'Light freezing rain',
-		67: 'Heavy freezing rain',
-		71: 'Slight snow fall',
-		73: 'Moderate snow fall',
-		75: 'Heavy snow fall',
-		77: 'Snow grains',
-		80: 'Slight rain showers',
-		81: 'Moderate rain showers',
-		82: 'Violent rain showers',
-		85: 'Slight snow showers',
-		86: 'Heavy snow showers',
-		95: 'Thunderstorm',
-		96: 'Thunderstorm with slight hail',
-		99: 'Thunderstorm with heavy hail',
-	}
-	return weatherCodes[code] || 'Unknown'
 }
 
 function getErrorMessage(error: unknown) {
